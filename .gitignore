@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv311/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local experiment artifacts
+.tmp/
+outputs/
+logs/
+runs/
+wandb/
+tb_logs/
+
+# Build artifacts
+build/
+dist/
+pip-wheel-metadata/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.tmp/
