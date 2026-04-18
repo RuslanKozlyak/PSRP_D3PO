@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class TokenBatchNorm(nn.Module):
@@ -12,7 +13,23 @@ class TokenBatchNorm(nn.Module):
         self.norm = nn.BatchNorm1d(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(x.transpose(1, 2)).transpose(1, 2)
+        transposed = x.transpose(1, 2)
+        # BatchNorm needs more than one value per channel in training mode.
+        # For tiny instances such as a single vehicle token, fall back to
+        # the accumulated running statistics so evaluation utilities keep working.
+        if self.training and (transposed.size(0) * transposed.size(2) <= 1):
+            normalized = F.batch_norm(
+                transposed,
+                self.norm.running_mean,
+                self.norm.running_var,
+                self.norm.weight,
+                self.norm.bias,
+                training=False,
+                momentum=0.0,
+                eps=self.norm.eps,
+            )
+            return normalized.transpose(1, 2)
+        return self.norm(transposed).transpose(1, 2)
 
 
 class AttentionBlock(nn.Module):

@@ -88,16 +88,23 @@ class D3PO(BaseAlgorithm):
             quantity_kl = kl_divergence(quantity_dist_a, quantity_dist_b) * quantity_mask
             total_kl = total_kl + quantity_kl.sum(dim=(-2, -1))
 
+        total_kl = torch.nan_to_num(total_kl, nan=0.0, posinf=1e3, neginf=0.0)
         preference_distance = torch.abs(batch.preferences - nearby_preferences).sum(dim=-1)
+        preference_distance = torch.nan_to_num(preference_distance, nan=0.0, posinf=1e3, neginf=0.0)
         diversity_loss = ((total_kl - self.alpha * preference_distance).pow(2)).mean()
+        diversity_loss = torch.nan_to_num(diversity_loss, nan=0.0, posinf=1e3, neginf=0.0)
 
         entropy_loss = entropy.mean()
+        entropy_loss = torch.nan_to_num(entropy_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        policy_loss = torch.nan_to_num(policy_loss, nan=0.0, posinf=1e3, neginf=-1e3)
+        value_loss = torch.nan_to_num(value_loss, nan=0.0, posinf=1e3, neginf=0.0)
         total_loss = (
             policy_loss
             + self.value_coef * value_loss
             + self.lambda_div * diversity_loss
             - self.entropy_coef * entropy_loss
         )
+        total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=1e3, neginf=-1e3)
         return {
             "total_loss": total_loss,
             "policy_loss": policy_loss,

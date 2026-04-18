@@ -133,7 +133,6 @@ class PPOLagrangian(BaseAlgorithm):
                 self.optimizer.step()
                 metrics = {key: float(value.detach().cpu()) for key, value in losses.items()}
 
-        metrics.update(self.post_update(rollouts))
         return metrics
 
     def post_update(self, rollouts: RolloutBatch) -> dict[str, float]:

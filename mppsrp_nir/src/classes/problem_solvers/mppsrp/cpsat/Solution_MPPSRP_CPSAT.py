@@ -125,7 +125,10 @@ class Solution_MPPSRP_CPSAT():
                     if y[k, r, t] == 1:
                         vehicle_capacities += np.sum( task.data_model["vehicle_compartments"][k] )
                         delivered_amount += np.sum( q[t, k, r, :, :, :] )
-        kpi_dict["average_vehicle_utilization"] = round( 100 * (delivered_amount / vehicle_capacities), 1 )
+        if vehicle_capacities > 0:
+            kpi_dict["average_vehicle_utilization"] = round(100 * (delivered_amount / vehicle_capacities), 1)
+        else:
+            kpi_dict["average_vehicle_utilization"] = 0.0
 
         kpi_dict["average_stops_per_trip"] = 0
         y = self.solution_values["y"]
@@ -138,7 +141,10 @@ class Solution_MPPSRP_CPSAT():
                     trips_count += y[k, r, t]
                     for i in range( self.n_nodes - 1 ):
                         stops_count += z[k, i, r, t]
-        kpi_dict["average_stops_per_trip"] = stops_count / trips_count
+        if trips_count > 0:
+            kpi_dict["average_stops_per_trip"] = stops_count / trips_count
+        else:
+            kpi_dict["average_stops_per_trip"] = 0.0
 
 
         return kpi_dict

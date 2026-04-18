@@ -25,9 +25,11 @@ class Trainer:
         self.rollout_length = int(self.config.get("rollout_length", 64))
         self.total_iterations = int(self.config.get("total_iterations", 10))
         self.eval_interval = int(self.config.get("eval_interval", 5))
+        self.eval_episodes = int(self.config.get("eval_episodes", 1))
         self.logger = build_logger()
         self.policy.to(self.device)
         self.evaluator = Evaluator(self.env, self.policy, self.device)
+        self.eval_preferences = self._resolve_eval_preferences()
 
     def train(self) -> list[dict[str, float]]:
         history: list[dict[str, float]] = []
@@ -90,7 +92,10 @@ class Trainer:
         return buffer.as_batch()
 
     def evaluate(self) -> dict[str, float]:
-        return self.evaluator.evaluate(episodes=1)
+        return self.evaluator.evaluate(
+            episodes=self.eval_episodes,
+            preferences=self.eval_preferences,
+        )
 
     def _to_tensor_dict(self, obs: dict[str, Any]) -> dict[str, torch.Tensor]:
         tensor_obs: dict[str, torch.Tensor] = {}
@@ -105,3 +110,14 @@ class Trainer:
         if hasattr(self.algo, "sample_preferences"):
             return self.algo.sample_preferences(1, device=self.device)
         return None
+
+    def _resolve_eval_preferences(self) -> torch.Tensor | None:
+        if not hasattr(self.algo, "sample_preferences"):
+            return None
+        preference = self.config.get("d3po_eval_preference")
+        if preference is None:
+            return None
+        tensor = torch.as_tensor(preference, dtype=torch.float32, device=self.device)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor

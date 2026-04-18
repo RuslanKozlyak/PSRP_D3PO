@@ -16,3 +16,4 @@ class PolicySourceTests(unittest.TestCase):
 
     def test_notebook_exists(self) -> None:
         self.assertTrue((ROOT / "notebooks" / "00_quickstart.ipynb").exists())
+        self.assertTrue((ROOT / "notebooks" / "01_cpsat_comparison.ipynb").exists())

@@ -1,13 +1,13 @@
-name: default
+name: full
 device: cpu
-total_iterations: 100
-rollout_length: 64
+total_iterations: 400
+rollout_length: 128
 n_envs: 1
-eval_interval: 5
-eval_episodes: 1
+eval_interval: 10
+eval_episodes: 8
 log_interval: 1
-save_interval: 10
-comparison_eval_episodes: 3
+save_interval: 25
+comparison_eval_episodes: 12
 comparison_algorithms: [ppo, ppo_lagrangian, d3po]
 d3po_eval_preference: [0.55, 0.15, 0.2, 0.1]
 experiment_seeds: [7, 11, 19, 23, 31]

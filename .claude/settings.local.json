@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(D:/PythonProjects/PSRP_D3PO/.venv/Scripts/python.exe -c ' *)",
+      "Bash(D:/PythonProjects/PSRP_D3PO/.venv/Scripts/python.exe -m pip list)",
+      "Bash(C:/Python313/python.exe -m pip list)"
+    ]
+  }
+}

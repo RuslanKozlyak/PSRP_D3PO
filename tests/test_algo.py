@@ -26,23 +26,27 @@ class AlgoSourceTests(unittest.TestCase):
                 ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     def test_notebook_json_valid(self) -> None:
-        notebook_path = ROOT / "notebooks" / "00_quickstart.ipynb"
-        with notebook_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        self.assertEqual(payload["nbformat"], 4)
+        for notebook_name in ("00_quickstart.ipynb", "01_cpsat_comparison.ipynb"):
+            notebook_path = ROOT / "notebooks" / notebook_name
+            with self.subTest(notebook=notebook_name):
+                with notebook_path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                self.assertEqual(payload["nbformat"], 4)
 
     def test_notebook_has_no_saved_error_outputs(self) -> None:
-        notebook_path = ROOT / "notebooks" / "00_quickstart.ipynb"
-        with notebook_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        error_outputs = [
-            output
-            for cell in payload["cells"]
-            if cell.get("cell_type") == "code"
-            for output in cell.get("outputs", [])
-            if output.get("output_type") == "error"
-        ]
-        self.assertEqual(error_outputs, [])
+        for notebook_name in ("00_quickstart.ipynb", "01_cpsat_comparison.ipynb"):
+            notebook_path = ROOT / "notebooks" / notebook_name
+            with self.subTest(notebook=notebook_name):
+                with notebook_path.open("r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                error_outputs = [
+                    output
+                    for cell in payload["cells"]
+                    if cell.get("cell_type") == "code"
+                    for output in cell.get("outputs", [])
+                    if output.get("output_type") == "error"
+                ]
+                self.assertEqual(error_outputs, [])
 
     def test_gitignore_exists(self) -> None:
         self.assertTrue((ROOT / ".gitignore").exists())
