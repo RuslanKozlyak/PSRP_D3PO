@@ -19,6 +19,7 @@ class RolloutBatch:
     preferences: torch.Tensor | None = None
     advantages: torch.Tensor | None = None
     returns: torch.Tensor | None = None
+    bootstrap_value: torch.Tensor | None = None
 
     def flatten(self) -> "RolloutBatch":
         n_leading_dims = len(self.dones.shape)
@@ -37,6 +38,7 @@ class RolloutBatch:
             preferences=_flatten_tensor(self.preferences, n_leading_dims),
             advantages=_flatten_tensor(self.advantages, n_leading_dims),
             returns=_flatten_tensor(self.returns, n_leading_dims),
+            bootstrap_value=self.bootstrap_value,
         )
 
     @property

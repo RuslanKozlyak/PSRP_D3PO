@@ -5,6 +5,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from src.benchmarks import cpsat as cpsat_benchmarks
+
 
 class Evaluator:
     def __init__(self, env: Any, policy: torch.nn.Module, device: torch.device) -> None:
@@ -17,56 +19,37 @@ class Evaluator:
         episodes: int = 1,
         preferences: torch.Tensor | np.ndarray | None = None,
     ) -> dict[str, float]:
-        total_reward = np.zeros(4, dtype=np.float64)
-        total_distance = 0.0
-        total_stockout = 0.0
-        total_steps = 0.0
         preference_tensor = self._prepare_preferences(preferences)
-        was_training = self.policy.training
-        self.policy.eval()
+        metrics = cpsat_benchmarks.evaluate_policy_kpis(
+            self.env,
+            self.policy,
+            episodes=episodes,
+            preferences=preference_tensor,
+            deterministic=True,
+            device=self.device,
+            return_reward_components=True,
+        )
 
-        try:
-            for _ in range(episodes):
-                obs, info = self.env.reset()
-                done = False
-                truncated = False
-                episode_steps = 0
-                while not done and not truncated:
-                    obs_t = {
-                        k: torch.as_tensor(v, device=self.device).unsqueeze(0)
-                        for k, v in obs.items()
-                    }
-                    with torch.no_grad():
-                        output = self.policy.act(
-                            obs_t,
-                            preferences=preference_tensor,
-                            deterministic=True,
-                        )
-                    action = {
-                        "vehicle": int(output.actions["vehicle"].item()),
-                        "node": int(output.actions["node"].item()),
-                        "quantity": output.actions["quantity"].squeeze(0).cpu().numpy(),
-                    }
-                    obs, reward_vec, done, truncated, info = self.env.step(action)
-                    total_reward += reward_vec
-                    episode_steps += 1
+        result: dict[str, float] = {}
+        for key in (
+            "total_travel_distance",
+            "total_travel_time",
+            "dry_runs",
+            "average_stock_levels_percent",
+            "average_vehicle_utilization",
+            "average_stops_per_trip",
+        ):
+            if key in metrics:
+                result[f"eval_{key}"] = float(metrics[key])
 
-                total_distance += info["cumulative_distance"]
-                total_stockout += info["cumulative_stockout"]
-                total_steps += episode_steps
-        finally:
-            if was_training:
-                self.policy.train()
-
-        return {
-            "eval_distance": total_distance / max(episodes, 1),
-            "eval_stockout": total_stockout / max(episodes, 1),
-            "eval_steps": total_steps / max(episodes, 1),
-            "eval_reward_distance": float(total_reward[0] / max(episodes, 1)),
-            "eval_reward_holding": float(total_reward[1] / max(episodes, 1)),
-            "eval_reward_safety": float(total_reward[2] / max(episodes, 1)),
-            "eval_reward_time_window": float(total_reward[3] / max(episodes, 1)),
-        }
+        reward_keys = sorted(key for key in metrics if key.startswith("reward_"))
+        reward_total = 0.0
+        for key in reward_keys:
+            result[f"eval_{key}"] = float(metrics[key])
+            reward_total += float(metrics[key])
+        if reward_keys:
+            result["eval_reward_total"] = reward_total
+        return result
 
     def _prepare_preferences(
         self,

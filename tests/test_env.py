@@ -7,8 +7,10 @@ from pathlib import Path
 import numpy as np
 from omegaconf import OmegaConf
 
+from src.env.dynamics import TransitionInfo
 from src.env.masks import compute_action_masks
 from src.env.mp_psrp_env import MPPSRPEnv
+from src.env.reward import RewardFn
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,7 +50,7 @@ class EnvSourceTests(unittest.TestCase):
         self.assertFalse(truncated)
         self.assertTrue(bool(info["day_advanced"]))
         self.assertEqual(int(info["day"]), 1)
-        self.assertLess(float(reward_vec[2]), 0.0)
+        self.assertLess(float(reward_vec[-1]), 0.0)
 
     def test_zero_delivery_station_visit_still_consumes_visit_and_blocks_self_loop(self) -> None:
         cfg = OmegaConf.load(ROOT / "configs" / "env" / "small.yaml")
@@ -101,3 +103,67 @@ class EnvSourceTests(unittest.TestCase):
         self.assertGreaterEqual(float(upper[product_idx]), 0.0)
         nonmatching = np.delete(upper, product_idx)
         self.assertTrue(np.allclose(nonmatching, 0.0))
+
+    def test_reward_mode_with_holding_has_three_components(self) -> None:
+        cfg = OmegaConf.load(ROOT / "configs" / "env" / "small.yaml")
+        env = MPPSRPEnv(cfg)
+        env.reset()
+        prev_state = env.state.copy()
+        next_state = env.state.copy()
+        next_state.station_inventory[:] = env.instance.safety_stock * 0.5
+        transition = TransitionInfo(day_advanced=True)
+
+        reward = RewardFn({"reward_mode": "with_holding"}).compute(
+            prev_state,
+            next_state,
+            transition,
+            env.instance,
+        )
+
+        self.assertEqual(tuple(RewardFn({"reward_mode": "with_holding"}).components), ("distance", "holding", "safety"))
+        self.assertEqual(reward.shape[0], 3)
+        self.assertLess(float(reward[1]), 0.0)
+        self.assertLess(float(reward[2]), 0.0)
+
+    def test_reward_mode_without_holding_has_two_components(self) -> None:
+        cfg = OmegaConf.load(ROOT / "configs" / "env" / "small.yaml")
+        env = MPPSRPEnv(cfg)
+        env.reset()
+        prev_state = env.state.copy()
+        next_state = env.state.copy()
+        next_state.station_inventory[:] = 0.0
+        transition = TransitionInfo(day_advanced=True)
+
+        reward = RewardFn({"reward_mode": "without_holding"}).compute(
+            prev_state,
+            next_state,
+            transition,
+            env.instance,
+        )
+
+        self.assertEqual(tuple(RewardFn({"reward_mode": "without_holding"}).components), ("distance", "safety"))
+        self.assertEqual(reward.shape[0], 2)
+        self.assertLess(float(reward[1]), 0.0)
+
+    def test_time_window_is_hard_mask_and_not_a_reward_component(self) -> None:
+        cfg = OmegaConf.load(ROOT / "configs" / "env" / "small.yaml")
+        env = MPPSRPEnv(cfg)
+        env.reset()
+
+        env.instance.time_window_end[:] = 0.0
+        env.masks = compute_action_masks(env.state, env.instance)
+        self.assertTrue(np.all(env.masks.node[:, 0]))
+        self.assertTrue(np.all(env.masks.node[:, 1:] == 0))
+
+        prev_state = env.state.copy()
+        next_state = env.state.copy()
+        transition = TransitionInfo(late_time=3.0)
+        reward_fn = RewardFn({"reward_mode": "with_holding"})
+        reward = reward_fn.compute(
+            prev_state,
+            next_state,
+            transition,
+            env.instance,
+        )
+        self.assertEqual(tuple(reward_fn.components), ("distance", "holding", "safety"))
+        self.assertEqual(reward.shape[0], 3)

@@ -12,7 +12,11 @@ from src.algo.rollout import RolloutBatch, index_tree
 class D3PO(BaseAlgorithm):
     def __init__(self, policy: torch.nn.Module, config: dict[str, Any]) -> None:
         super().__init__(policy, config)
-        self.n_objectives = int(self.config.get("n_objectives", 4))
+        raw_n_objectives = self.config.get("n_objectives", "auto")
+        if isinstance(raw_n_objectives, str) and raw_n_objectives.lower() == "auto":
+            self.n_objectives = int(getattr(policy, "n_objectives", 1))
+        else:
+            self.n_objectives = int(raw_n_objectives)
         self.lambda_div = float(self.config.get("lambda_div", 0.01))
         self.alpha = float(self.config.get("alpha", 1.0))
         self.preference_neighborhood_radius = float(
@@ -37,6 +41,7 @@ class D3PO(BaseAlgorithm):
             dones=rollouts.dones.unsqueeze(-1),
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
+            bootstrap_value=rollouts.bootstrap_value,
         )
         returns = advantages + rollouts.values_vec
 
@@ -60,16 +65,22 @@ class D3PO(BaseAlgorithm):
             batch.actions,
             preferences=batch.preferences,
         )
-        ratio = torch.exp(new_log_prob - batch.log_probs)
+        log_ratio = new_log_prob - batch.log_probs
+        ratio = torch.exp(log_ratio)
 
-        per_objective_terms = []
+        per_objective_surrogates = []
         for objective_idx in range(self.n_objectives):
             adv_i = batch.advantages[..., objective_idx]
             surr1 = ratio * adv_i
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv_i
-            per_objective_terms.append(-torch.min(surr1, surr2))
-        per_objective_loss = torch.stack(per_objective_terms, dim=-1)
-        policy_loss = (batch.preferences * per_objective_loss).sum(dim=-1).mean()
+            per_objective_surrogates.append(torch.min(surr1, surr2))
+        per_objective_surrogate = torch.stack(per_objective_surrogates, dim=-1)
+        preference_weights = batch.preferences
+        weighted_surrogate = (preference_weights * per_objective_surrogate).sum(dim=-1)
+        policy_loss = -weighted_surrogate.mean()
+        policy_surrogate_abs = (preference_weights * per_objective_surrogate.abs()).sum(dim=-1).mean()
+        approx_kl = ((ratio - 1.0) - log_ratio).mean()
+        clip_fraction = ((ratio - 1.0).abs() > self.clip_eps).float().mean()
 
         value_loss = torch.nn.functional.mse_loss(values_vec, batch.returns)
 
@@ -108,9 +119,12 @@ class D3PO(BaseAlgorithm):
         return {
             "total_loss": total_loss,
             "policy_loss": policy_loss,
+            "policy_surrogate_abs": policy_surrogate_abs,
             "value_loss": value_loss,
             "diversity_loss": diversity_loss,
             "entropy": entropy_loss,
+            "approx_kl": approx_kl,
+            "clip_fraction": clip_fraction,
         }
 
     def update(self, rollouts: RolloutBatch) -> dict[str, float]:
@@ -121,28 +135,50 @@ class D3PO(BaseAlgorithm):
         if flat.preferences is None:
             raise ValueError("D3PO update requires rollout preferences.")
 
-        metrics: dict[str, float] = {}
+        metrics_sum: dict[str, float] = {}
+        update_steps = 0
         num_samples = flat.batch_size
-        for _ in range(self.update_epochs):
-            indices = torch.randperm(num_samples, device=flat.log_probs.device)
-            for start in range(0, num_samples, self.minibatch_size):
-                batch_idx = indices[start : start + self.minibatch_size]
-                batch = RolloutBatch(
-                    observations=index_tree(flat.observations, batch_idx),
-                    actions=index_tree(flat.actions, batch_idx),
-                    log_probs=flat.log_probs[batch_idx],
-                    rewards_vec=flat.rewards_vec[batch_idx],
-                    dones=flat.dones[batch_idx],
-                    values_vec=flat.values_vec[batch_idx],
-                    masks=index_tree(flat.masks, batch_idx),
-                    preferences=flat.preferences[batch_idx],
-                    advantages=None if flat.advantages is None else flat.advantages[batch_idx],
-                    returns=None if flat.returns is None else flat.returns[batch_idx],
-                )
-                losses = self.compute_loss(batch)
-                self.optimizer.zero_grad()
-                losses["total_loss"].backward()
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                metrics = {key: float(value.detach().cpu()) for key, value in losses.items()}
-        return metrics
+        early_stop = False
+        was_training = self.policy.training
+        self.policy.eval()
+        try:
+            for _ in range(self.update_epochs):
+                indices = torch.randperm(num_samples, device=flat.log_probs.device)
+                for start in range(0, num_samples, self.minibatch_size):
+                    batch_idx = indices[start : start + self.minibatch_size]
+                    batch = RolloutBatch(
+                        observations=index_tree(flat.observations, batch_idx),
+                        actions=index_tree(flat.actions, batch_idx),
+                        log_probs=flat.log_probs[batch_idx],
+                        rewards_vec=flat.rewards_vec[batch_idx],
+                        dones=flat.dones[batch_idx],
+                        values_vec=flat.values_vec[batch_idx],
+                        masks=index_tree(flat.masks, batch_idx),
+                        preferences=flat.preferences[batch_idx],
+                        advantages=None if flat.advantages is None else flat.advantages[batch_idx],
+                        returns=None if flat.returns is None else flat.returns[batch_idx],
+                    )
+                    losses = self.compute_loss(batch)
+                    approx_kl = float(losses["approx_kl"].detach().cpu())
+                    if approx_kl > self.target_kl:
+                        early_stop = True
+                        break
+                    self.optimizer.zero_grad()
+                    losses["total_loss"].backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
+                    step_metrics = {key: float(value.detach().cpu()) for key, value in losses.items()}
+                    for key, value in step_metrics.items():
+                        metrics_sum[key] = metrics_sum.get(key, 0.0) + value
+                    update_steps += 1
+                if early_stop:
+                    break
+        finally:
+            if was_training:
+                self.policy.train()
+
+        if update_steps == 0:
+            return {"early_stop": float(early_stop)}
+        averaged = {key: value / update_steps for key, value in metrics_sum.items()}
+        averaged["early_stop"] = float(early_stop)
+        return averaged

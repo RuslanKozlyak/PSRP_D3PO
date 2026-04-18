@@ -8,9 +8,11 @@ entropy_coef: 0.01
 max_grad_norm: 0.5
 update_epochs: 4
 minibatch_size: 128
-reward_index: 0
-cost_indices: [2, 3]
-cost_targets: [0.0, 0.0]
+target_kl: 0.03
+reward_indices: auto
+reward_weights: auto
+cost_indices: auto
+cost_targets: auto
 lambda_lr: 0.01
 use_pid: true
 pid:

@@ -9,5 +9,5 @@ log_interval: 1
 save_interval: 10
 comparison_eval_episodes: 8
 comparison_algorithms: [ppo, ppo_lagrangian, d3po]
-d3po_eval_preference: [0.55, 0.15, 0.2, 0.1]
+d3po_eval_preference: auto
 experiment_seeds: [7, 17, 29]

@@ -23,6 +23,7 @@ class BaseAlgorithm(ABC):
         self.max_grad_norm = float(self.config.get("max_grad_norm", 0.5))
         self.update_epochs = int(self.config.get("update_epochs", 4))
         self.minibatch_size = int(self.config.get("minibatch_size", 128))
+        self.target_kl = float(self.config.get("target_kl", 0.05))
         self.optimizer = optim.Adam(
             self.policy.parameters(),
             lr=float(self.config.get("learning_rate", 3e-4)),
@@ -35,10 +36,14 @@ class BaseAlgorithm(ABC):
         dones: torch.Tensor,
         gamma: float,
         gae_lambda: float,
+        bootstrap_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
         advantages = torch.zeros_like(rewards)
         last_advantage = torch.zeros_like(rewards[-1])
-        next_value = torch.zeros_like(values[-1])
+        if bootstrap_value is None:
+            next_value = torch.zeros_like(values[-1])
+        else:
+            next_value = bootstrap_value.to(values.device, values.dtype)
 
         for step in reversed(range(rewards.size(0))):
             not_done = 1.0 - dones[step].float()

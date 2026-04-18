@@ -8,7 +8,8 @@ entropy_coef: 0.01
 max_grad_norm: 0.5
 update_epochs: 4
 minibatch_size: 128
-n_objectives: 4
+target_kl: 0.03
+n_objectives: auto
 lambda_div: 0.01
 alpha: 1.0
 preference_neighborhood_radius: 0.05

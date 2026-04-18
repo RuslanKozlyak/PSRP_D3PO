@@ -72,6 +72,44 @@ def build_cpsat_bundle(
     return json.loads(lines[-1])
 
 
+def build_graph_generator_weight_matrix(
+    graph_config: dict[str, Any],
+    *,
+    python_executable: str | None = None,
+    repo_root: str | Path | None = None,
+) -> np.ndarray:
+    root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+    helper_script = root / "mppsrp_nir" / "export_graph_generator_weight_matrix.py"
+    if not helper_script.exists():
+        raise FileNotFoundError(f"Expected helper script at {helper_script}")
+
+    command = [
+        python_executable or sys.executable,
+        str(helper_script),
+        "--payload",
+        json.dumps(dict(graph_config)),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=str(helper_script.parent),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "Graph generator export failed.\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("Graph generator export produced no JSON output.")
+    payload = json.loads(lines[-1])
+    return np.asarray(payload["weight_matrix"], dtype=np.int64)
+
+
 def cpsat_data_model_to_instance(
     data_model: dict[str, Any],
     *,
@@ -175,101 +213,152 @@ def evaluate_policy_kpis(
     env: Any,
     policy: torch.nn.Module,
     *,
+    episodes: int = 1,
     preferences: torch.Tensor | np.ndarray | None = None,
     deterministic: bool = True,
     device: torch.device | str | None = None,
     max_steps: int | None = None,
-) -> dict[str, float]:
+    return_reward_components: bool = False,
+) -> dict[str, Any]:
     resolved_device = _resolve_device(policy, device)
     was_training = policy.training
     policy.eval()
-    obs, _ = env.reset()
     pref_tensor = _prepare_preferences(preferences, resolved_device)
-    done = False
-    truncated = False
-    step_limit = max_steps if max_steps is not None else env.instance.max_steps
-    step_idx = 0
-
-    day_end_fill_ratios: list[float] = []
-    dry_runs = 0
-    total_travel_time = 0.0
-    total_delivered_amount = 0.0
-    total_trip_capacity = 0.0
-    total_trips = 0
-    total_stops = 0
-    vehicle_trip_state = {
-        vehicle_idx: {"active": False, "delivered": 0.0, "stops": 0}
-        for vehicle_idx in range(env.instance.n_vehicles)
+    n_eval_episodes = max(int(episodes), 1)
+    horizon_days = int(env.instance.horizon_days)
+    average_stock_levels_accum = np.zeros(horizon_days, dtype=np.float64)
+    reward_components = tuple(getattr(env.reward_fn, "components", ()))
+    total_reward = np.zeros(len(reward_components), dtype=np.float64)
+    scalar_totals = {
+        "total_travel_distance": 0.0,
+        "total_travel_time": 0.0,
+        "dry_runs": 0.0,
+        "average_stock_levels_percent": 0.0,
+        "average_vehicle_utilization": 0.0,
+        "average_stops_per_trip": 0.0,
     }
 
     try:
-        while not done and not truncated and step_idx < step_limit:
-            obs_t = _to_tensor_dict(obs, resolved_device)
-            with torch.no_grad():
-                output = policy.act(obs_t, preferences=pref_tensor, deterministic=deterministic)
+        for _ in range(n_eval_episodes):
+            obs, _ = env.reset()
+            done = False
+            truncated = False
+            step_limit = max_steps if max_steps is not None else env.instance.max_steps
+            step_idx = 0
 
-            vehicle_idx = int(output.actions["vehicle"].item())
-            node_idx = int(output.actions["node"].item())
-            quantity_action = output.actions["quantity"].squeeze(0).detach().cpu().numpy()
+            day_end_fill_ratios: list[float] = []
+            day_end_inventory: list[np.ndarray] = []
+            dry_runs = 0.0
+            total_travel_time = 0.0
+            total_delivered_amount = 0.0
+            total_trip_capacity = 0.0
+            total_trips = 0.0
+            total_stops = 0.0
+            vehicle_trip_state = {
+                vehicle_idx: {"active": False, "delivered": 0.0, "stops": 0}
+                for vehicle_idx in range(env.instance.n_vehicles)
+            }
 
-            prev_day = int(env.state.day)
-            prev_node = int(env.state.vehicle_node[vehicle_idx])
-            prev_vehicle_volume = float(env.state.compartment_volume[vehicle_idx].sum())
-            total_travel_time += float(env.instance.travel_time_matrix[prev_node, node_idx])
+            while not done and not truncated and step_idx < step_limit:
+                obs_t = _to_tensor_dict(obs, resolved_device)
+                with torch.no_grad():
+                    output = policy.act(obs_t, preferences=pref_tensor, deterministic=deterministic)
 
-            if node_idx > 0:
-                vehicle_trip_state[vehicle_idx]["active"] = True
-                vehicle_trip_state[vehicle_idx]["stops"] += 1
+                vehicle_idx = int(output.actions["vehicle"].item())
+                node_idx = int(output.actions["node"].item())
+                quantity_action = output.actions["quantity"].squeeze(0).detach().cpu().numpy()
 
-            next_obs, _, done, truncated, info = env.step(
-                {
-                    "vehicle": vehicle_idx,
-                    "node": node_idx,
-                    "quantity": quantity_action,
-                }
+                prev_day = int(env.state.day)
+                prev_node = int(env.state.vehicle_node[vehicle_idx])
+                prev_vehicle_volume = float(env.state.compartment_volume[vehicle_idx].sum())
+                total_travel_time += float(env.instance.travel_time_matrix[prev_node, node_idx])
+
+                if node_idx > 0:
+                    vehicle_trip_state[vehicle_idx]["active"] = True
+                    vehicle_trip_state[vehicle_idx]["stops"] += 1
+
+                next_obs, reward_vec, done, truncated, _ = env.step(
+                    {
+                        "vehicle": vehicle_idx,
+                        "node": node_idx,
+                        "quantity": quantity_action,
+                    }
+                )
+                if return_reward_components:
+                    total_reward += reward_vec
+
+                if node_idx > 0:
+                    delivered = max(prev_vehicle_volume - float(env.state.compartment_volume[vehicle_idx].sum()), 0.0)
+                    total_delivered_amount += max(delivered, 0.0)
+                    vehicle_trip_state[vehicle_idx]["delivered"] += max(delivered, 0.0)
+
+                if node_idx == 0 and vehicle_trip_state[vehicle_idx]["active"]:
+                    total_trips += 1.0
+                    total_stops += float(vehicle_trip_state[vehicle_idx]["stops"])
+                    total_trip_capacity += float(env.instance.vehicle_total_capacity[vehicle_idx])
+                    vehicle_trip_state[vehicle_idx] = {"active": False, "delivered": 0.0, "stops": 0}
+
+                if int(env.state.day) > prev_day:
+                    current_inventory = env.state.station_inventory.copy()
+                    day_end_fill_ratios.extend(
+                        (
+                            current_inventory / np.maximum(env.instance.station_capacity, 1e-6)
+                        ).reshape(-1).tolist()
+                    )
+                    day_end_inventory.append(current_inventory)
+                    dry_runs += float(
+                        np.sum(current_inventory <= env.instance.safety_stock)
+                    )
+
+                obs = next_obs
+                step_idx += 1
+
+            while len(day_end_inventory) < horizon_days:
+                day_end_inventory.append(env.state.station_inventory.copy())
+
+            average_stock_levels = _average_stock_levels_like_cpsat(
+                day_end_inventory=day_end_inventory,
+                n_days=horizon_days,
             )
+            average_stock_levels_accum += average_stock_levels
 
-            if node_idx > 0:
-                delivered = max(prev_vehicle_volume - float(env.state.compartment_volume[vehicle_idx].sum()), 0.0)
-                total_delivered_amount += max(delivered, 0.0)
-                vehicle_trip_state[vehicle_idx]["delivered"] += max(delivered, 0.0)
+            average_fill_percent = (
+                100.0 * float(np.mean(day_end_fill_ratios))
+                if day_end_fill_ratios
+                else 0.0
+            )
+            utilization = (
+                round(100.0 * (total_delivered_amount / total_trip_capacity), 1)
+                if total_trip_capacity > 0
+                else 0.0
+            )
+            avg_stops_per_trip = float(total_stops / total_trips) if total_trips > 0 else 0.0
 
-            if node_idx == 0 and vehicle_trip_state[vehicle_idx]["active"]:
-                total_trips += 1
-                total_stops += int(vehicle_trip_state[vehicle_idx]["stops"])
-                total_trip_capacity += float(env.instance.vehicle_total_capacity[vehicle_idx])
-                vehicle_trip_state[vehicle_idx] = {"active": False, "delivered": 0.0, "stops": 0}
-
-            if int(env.state.day) > prev_day:
-                day_end_fill_ratios.extend(
-                    (
-                        env.state.station_inventory / np.maximum(env.instance.station_capacity, 1e-6)
-                    ).reshape(-1).tolist()
-                )
-                dry_runs += int(
-                    np.sum(env.state.station_inventory <= env.instance.safety_stock)
-                )
-
-            obs = next_obs
-            step_idx += 1
+            scalar_totals["total_travel_distance"] += float(env.state.cumulative_distance)
+            scalar_totals["total_travel_time"] += float(total_travel_time)
+            scalar_totals["dry_runs"] += float(dry_runs)
+            scalar_totals["average_stock_levels_percent"] += float(average_fill_percent)
+            scalar_totals["average_vehicle_utilization"] += float(utilization)
+            scalar_totals["average_stops_per_trip"] += float(avg_stops_per_trip)
     finally:
         if was_training:
             policy.train()
 
-    average_fill_percent = 100.0 * float(np.mean(day_end_fill_ratios)) if day_end_fill_ratios else 0.0
-    utilization = 100.0 * (total_delivered_amount / total_trip_capacity) if total_trip_capacity > 0 else 0.0
-    avg_stops_per_trip = float(total_stops / total_trips) if total_trips > 0 else 0.0
-
-    return {
-        "total_travel_distance": float(env.state.cumulative_distance),
-        "total_travel_time": float(total_travel_time),
-        "dry_runs": float(dry_runs),
-        "average_stock_levels_percent": float(average_fill_percent),
-        "average_vehicle_utilization": float(utilization),
-        "average_stops_per_trip": float(avg_stops_per_trip),
-        "cumulative_stockout": float(env.state.cumulative_stockout),
-        "steps": float(env.state.total_steps),
+    result: dict[str, Any] = {
+        key: float(value / n_eval_episodes)
+        for key, value in scalar_totals.items()
     }
+    mean_stock_levels = average_stock_levels_accum / float(n_eval_episodes)
+    if n_eval_episodes == 1:
+        result["average_stock_levels"] = np.rint(mean_stock_levels).astype(np.int64).tolist()
+    else:
+        result["average_stock_levels"] = mean_stock_levels.tolist()
+
+    if return_reward_components:
+        for idx, component in enumerate(reward_components):
+            result[f"reward_{component}"] = float(total_reward[idx] / n_eval_episodes)
+
+    return result
 
 
 def compare_policy_to_cpsat(
@@ -289,6 +378,7 @@ def compare_policy_to_cpsat(
     rl_metrics = evaluate_policy_kpis(
         env,
         policy,
+        episodes=1,
         preferences=preferences,
         deterministic=deterministic,
         device=device,
@@ -368,3 +458,16 @@ def _prepare_preferences(
     if tensor.ndim == 1:
         tensor = tensor.unsqueeze(0)
     return tensor
+
+
+def _average_stock_levels_like_cpsat(
+    *,
+    day_end_inventory: list[np.ndarray],
+    n_days: int,
+) -> np.ndarray:
+    average_stock_levels = np.zeros((n_days,), dtype=np.float64)
+    for day_idx in range(n_days):
+        current_inventory = np.asarray(day_end_inventory[day_idx], dtype=np.float64)
+        current_levels = current_inventory[:, -1]
+        average_stock_levels[day_idx] = float(current_levels[current_levels != 0].sum())
+    return average_stock_levels

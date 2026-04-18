@@ -5,6 +5,11 @@ import json
 import unittest
 from pathlib import Path
 
+import torch
+
+from src.algo.base import BaseAlgorithm
+from src.train.notebook import build_components, load_config
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -50,3 +55,33 @@ class AlgoSourceTests(unittest.TestCase):
 
     def test_gitignore_exists(self) -> None:
         self.assertTrue((ROOT / ".gitignore").exists())
+
+    def test_d3po_auto_objectives_follow_reward_mode(self) -> None:
+        with_holding_cfg = load_config(["env=small", "algo=d3po", "experiment=smoke", "env.reward_mode=with_holding"])
+        env, policy, _, _ = build_components(with_holding_cfg)
+        self.assertEqual(tuple(env.reward_fn.components), ("distance", "holding", "safety"))
+        self.assertEqual(policy.n_objectives, 3)
+
+        without_holding_cfg = load_config(
+            ["env=small", "algo=d3po", "experiment=smoke", "env.reward_mode=without_holding"]
+        )
+        env, policy, _, _ = build_components(without_holding_cfg)
+        self.assertEqual(tuple(env.reward_fn.components), ("distance", "safety"))
+        self.assertEqual(policy.n_objectives, 2)
+
+    def test_compute_gae_uses_bootstrap_value_for_unfinished_rollout(self) -> None:
+        rewards = torch.zeros(1, 1)
+        values = torch.zeros(1, 1)
+        dones = torch.zeros(1, 1)
+        bootstrap_value = torch.ones(1, 1)
+
+        advantages = BaseAlgorithm.compute_gae(
+            rewards=rewards,
+            values=values,
+            dones=dones,
+            gamma=0.99,
+            gae_lambda=1.0,
+            bootstrap_value=bootstrap_value,
+        )
+
+        self.assertAlmostEqual(float(advantages.item()), 0.99, places=6)

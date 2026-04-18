@@ -11,6 +11,7 @@ from omegaconf import DictConfig, OmegaConf
 from src.algo.d3po import D3PO
 from src.algo.ppo import PPO
 from src.algo.ppo_lagrangian import PPOLagrangian
+from src.benchmarks import cpsat as cpsat_benchmarks
 from src.env.instance import MPPSRPInstance
 from src.env.mp_psrp_env import MPPSRPEnv
 from src.policy.policy import HierarchicalPolicy
@@ -54,7 +55,11 @@ def _build_components_from_env(
     algo_cfg: dict[str, Any],
     exp_cfg: dict[str, Any],
 ) -> tuple[MPPSRPEnv, HierarchicalPolicy, Any, Trainer]:
-    n_objectives = int(algo_cfg.get("n_objectives", 4))
+    raw_n_objectives = algo_cfg.get("n_objectives", "auto")
+    if isinstance(raw_n_objectives, str) and raw_n_objectives.lower() == "auto":
+        n_objectives = len(env.reward_fn.components)
+    else:
+        n_objectives = int(raw_n_objectives)
     policy = HierarchicalPolicy.from_env(env, policy_cfg, n_objectives=n_objectives)
     algo = build_algorithm(policy, algo_cfg)
     trainer = Trainer(env, policy, algo, exp_cfg)
@@ -233,16 +238,13 @@ def rollout_episode(
 
         step_record.update(
             {
-                "reward_distance": float(reward_vec[0]),
-                "reward_holding": float(reward_vec[1]),
-                "reward_safety": float(reward_vec[2]),
-                "reward_time_window": float(reward_vec[3]),
                 "cumulative_distance": float(info["cumulative_distance"]),
                 "cumulative_stockout": float(info["cumulative_stockout"]),
                 "delivered_volume": actual_delivered,
                 "day_advanced": bool(info.get("day_advanced", False)),
             }
         )
+        step_record.update(_reward_components_to_dict(env.reward_fn.components, reward_vec))
         steps.append(step_record)
         inventory_snapshots.append(env.state.station_inventory.copy())
         vehicle_times.append(env.state.vehicle_time.copy())
@@ -265,6 +267,7 @@ def rollout_episode(
         "delivered_per_station_day": delivered_per_station_day,
         "routes_per_day": routes_per_day,
         "preferences": None if pref_tensor is None else pref_tensor.detach().cpu().numpy(),
+        "reward_components": tuple(env.reward_fn.components),
     }
 
 
@@ -275,31 +278,33 @@ def episode_to_frame(episode: dict[str, Any]) -> Any:
 
 def episode_summary(episode: dict[str, Any]) -> dict[str, float]:
     steps = episode["steps"]
+    reward_components = tuple(episode.get("reward_components", ()))
     if not steps:
-        return {
+        summary = {
             "n_steps": 0.0,
             "distance": 0.0,
             "stockout": 0.0,
-            "reward_distance": 0.0,
-            "reward_holding": 0.0,
-            "reward_safety": 0.0,
-            "reward_time_window": 0.0,
         }
+        for component in reward_components:
+            summary[f"reward_{component}"] = 0.0
+        return summary
 
-    return {
+    summary = {
         "n_steps": float(len(steps)),
         "distance": float(episode["terminal_info"]["cumulative_distance"]),
         "stockout": float(episode["terminal_info"]["cumulative_stockout"]),
-        "reward_distance": float(sum(step["reward_distance"] for step in steps)),
-        "reward_holding": float(sum(step["reward_holding"] for step in steps)),
-        "reward_safety": float(sum(step["reward_safety"] for step in steps)),
-        "reward_time_window": float(sum(step["reward_time_window"] for step in steps)),
     }
+    for component in reward_components:
+        key = f"reward_{component}"
+        summary[key] = float(sum(step.get(key, 0.0) for step in steps))
+    return summary
 
 
 def resolve_eval_preferences(
     cfg: DictConfig,
     preferences: torch.Tensor | np.ndarray | None = None,
+    *,
+    n_objectives: int | None = None,
 ) -> torch.Tensor | np.ndarray | None:
     if preferences is not None:
         return preferences
@@ -310,6 +315,13 @@ def resolve_eval_preferences(
     default_preference = cfg_dict["experiment"].get("d3po_eval_preference")
     if default_preference is None:
         return None
+    if isinstance(default_preference, str) and default_preference.lower() == "auto":
+        resolved_n_objectives = int(n_objectives or 1)
+        if resolved_n_objectives == 3:
+            return np.asarray([0.55, 0.15, 0.30], dtype=np.float32)
+        if resolved_n_objectives == 2:
+            return np.asarray([0.70, 0.30], dtype=np.float32)
+        return np.full((resolved_n_objectives,), 1.0 / max(resolved_n_objectives, 1), dtype=np.float32)
     return np.asarray(default_preference, dtype=np.float32)
 
 
@@ -322,38 +334,17 @@ def evaluate_policy(
     preferences: torch.Tensor | np.ndarray | None = None,
     max_steps: int | None = None,
     device: torch.device | str | None = None,
-) -> dict[str, float]:
-    was_training = policy.training
-    policy.eval()
-    totals = {
-        "n_steps": 0.0,
-        "distance": 0.0,
-        "stockout": 0.0,
-        "reward_distance": 0.0,
-        "reward_holding": 0.0,
-        "reward_safety": 0.0,
-        "reward_time_window": 0.0,
-    }
-
-    try:
-        for _ in range(max(int(episodes), 1)):
-            episode = rollout_episode(
-                env,
-                policy,
-                deterministic=deterministic,
-                preferences=preferences,
-                max_steps=max_steps,
-                device=device,
-            )
-            summary = episode_summary(episode)
-            for key, value in summary.items():
-                totals[key] += float(value)
-    finally:
-        if was_training:
-            policy.train()
-
-    divisor = float(max(int(episodes), 1))
-    return {key: value / divisor for key, value in totals.items()}
+) -> dict[str, Any]:
+    return cpsat_benchmarks.evaluate_policy_kpis(
+        env,
+        policy,
+        episodes=episodes,
+        preferences=preferences,
+        deterministic=deterministic,
+        device=device,
+        max_steps=max_steps,
+        return_reward_components=True,
+    )
 
 
 def run_training_pipeline(
@@ -370,7 +361,11 @@ def run_training_pipeline(
         env, policy, algo, trainer = build_components_from_instance(cfg, instance)
 
     cfg_dict = _config_to_dict(cfg)
-    resolved_preferences = resolve_eval_preferences(cfg, preferences=eval_preferences)
+    resolved_preferences = resolve_eval_preferences(
+        cfg,
+        preferences=eval_preferences,
+        n_objectives=policy.n_objectives,
+    )
     eval_episodes = int(
         comparison_eval_episodes
         if comparison_eval_episodes is not None
@@ -380,7 +375,7 @@ def run_training_pipeline(
         )
     )
 
-    before_episode = rollout_episode(
+    before_episode = _rollout_for_display(
         env,
         policy,
         deterministic=deterministic_eval,
@@ -388,7 +383,7 @@ def run_training_pipeline(
         device=trainer.device,
     )
     history = trainer.train()
-    after_episode = rollout_episode(
+    after_episode = _rollout_for_display(
         env,
         policy,
         deterministic=deterministic_eval,
@@ -414,8 +409,8 @@ def run_training_pipeline(
         "history_frame": history_to_frame(history),
         "before_episode": before_episode,
         "after_episode": after_episode,
-        "before_summary": episode_summary(before_episode),
-        "after_summary": episode_summary(after_episode),
+        "before_summary": episode_kpis(env, before_episode),
+        "after_summary": episode_kpis(env, after_episode),
         "evaluation": evaluation,
         "eval_preferences": resolved_preferences,
         "comparison_eval_episodes": eval_episodes,
@@ -469,35 +464,50 @@ def comparison_summary_frame(results: dict[str, dict[str, Any]]) -> Any:
     rows: list[dict[str, Any]] = []
     for label, result in results.items():
         cfg_dict = _config_to_dict(result["cfg"])
+        before = result["before_summary"]
+        after = result["after_summary"]
         row: dict[str, Any] = {
             "algorithm": label,
             "algo_name": cfg_dict["algo"]["name"],
             "env_name": cfg_dict["env"]["name"],
-            "before_distance": result["before_summary"]["distance"],
-            "after_distance": result["after_summary"]["distance"],
-            "before_stockout": result["before_summary"]["stockout"],
-            "after_stockout": result["after_summary"]["stockout"],
-            "before_steps": result["before_summary"]["n_steps"],
-            "after_steps": result["after_summary"]["n_steps"],
-            "distance_improvement": result["before_summary"]["distance"] - result["after_summary"]["distance"],
-            "stockout_improvement": result["before_summary"]["stockout"] - result["after_summary"]["stockout"],
+            "before_total_travel_distance": before["total_travel_distance"],
+            "after_total_travel_distance": after["total_travel_distance"],
+            "before_dry_runs": before["dry_runs"],
+            "after_dry_runs": after["dry_runs"],
+            "before_average_stock_levels_percent": before["average_stock_levels_percent"],
+            "after_average_stock_levels_percent": after["average_stock_levels_percent"],
+            "before_average_vehicle_utilization": before["average_vehicle_utilization"],
+            "after_average_vehicle_utilization": after["average_vehicle_utilization"],
+            "before_average_stops_per_trip": before["average_stops_per_trip"],
+            "after_average_stops_per_trip": after["average_stops_per_trip"],
+            "before_total_travel_time": before["total_travel_time"],
+            "after_total_travel_time": after["total_travel_time"],
         }
-        row["untrained_distance"] = row["before_distance"]
-        row["trained_distance"] = row["after_distance"]
-        row["untrained_stockout"] = row["before_stockout"]
-        row["trained_stockout"] = row["after_stockout"]
-        row["untrained_steps"] = row["before_steps"]
-        row["trained_steps"] = row["after_steps"]
-        row["distance_improvement_pct"] = (
-            100.0 * row["distance_improvement"] / max(abs(row["before_distance"]), 1e-6)
+        row["before_distance"] = row["before_total_travel_distance"]
+        row["after_distance"] = row["after_total_travel_distance"]
+        row["untrained_total_travel_distance"] = row["before_total_travel_distance"]
+        row["trained_total_travel_distance"] = row["after_total_travel_distance"]
+        row["untrained_dry_runs"] = row["before_dry_runs"]
+        row["trained_dry_runs"] = row["after_dry_runs"]
+        row["untrained_average_stock_levels_percent"] = row["before_average_stock_levels_percent"]
+        row["trained_average_stock_levels_percent"] = row["after_average_stock_levels_percent"]
+        row["distance_improvement"] = row["before_total_travel_distance"] - row["after_total_travel_distance"]
+        row["dry_runs_improvement"] = row["before_dry_runs"] - row["after_dry_runs"]
+        row["average_stock_levels_percent_improvement"] = (
+            row["after_average_stock_levels_percent"] - row["before_average_stock_levels_percent"]
         )
-        row["stockout_improvement_pct"] = (
-            100.0 * row["stockout_improvement"] / max(abs(row["before_stockout"]), 1e-6)
-            if abs(row["before_stockout"]) > 1e-6
+        row["distance_improvement_pct"] = (
+            100.0 * row["distance_improvement"] / max(abs(row["before_total_travel_distance"]), 1e-6)
+        )
+        row["dry_runs_improvement_pct"] = (
+            100.0 * row["dry_runs_improvement"] / max(abs(row["before_dry_runs"]), 1e-6)
+            if abs(row["before_dry_runs"]) > 1e-6
             else 0.0
         )
+        row["fill_percent_improvement"] = row["average_stock_levels_percent_improvement"]
         for key, value in result.get("evaluation", {}).items():
-            row[f"eval_{key}"] = float(value)
+            if isinstance(value, (int, float)):
+                row[f"eval_{key}"] = float(value)
         for key, value in result.get("final_metrics", {}).items():
             if isinstance(value, (int, float)):
                 row[f"final_{key}"] = float(value)
@@ -538,15 +548,36 @@ def cpsat_comparison_frame(comparisons: dict[str, dict[str, Any]]) -> Any:
     frame = frame.sort_values("solver").set_index("solver")
 
     if "cpsat" in frame.index:
-        for metric in ("total_travel_distance", "cumulative_stockout", "steps"):
+        unsupported_metrics = [
+            column
+            for column in frame.columns
+            if column != "source" and _is_missing_scalar(frame.loc["cpsat", column], pd)
+        ]
+        if unsupported_metrics:
+            frame = frame.drop(columns=unsupported_metrics)
+
+        for metric in (
+            "total_travel_distance",
+            "total_travel_time",
+            "dry_runs",
+            "average_stock_levels_percent",
+            "average_vehicle_utilization",
+            "average_stops_per_trip",
+        ):
             if metric in frame.columns:
                 frame[f"{metric}_gap_to_cpsat"] = frame[metric] - float(frame.loc["cpsat", metric])
         if "total_travel_distance_gap_to_cpsat" in frame.columns:
             frame.loc["cpsat", "total_travel_distance_gap_to_cpsat"] = 0.0
-        if "cumulative_stockout_gap_to_cpsat" in frame.columns:
-            frame.loc["cpsat", "cumulative_stockout_gap_to_cpsat"] = 0.0
-        if "steps_gap_to_cpsat" in frame.columns:
-            frame.loc["cpsat", "steps_gap_to_cpsat"] = 0.0
+        if "total_travel_time_gap_to_cpsat" in frame.columns:
+            frame.loc["cpsat", "total_travel_time_gap_to_cpsat"] = 0.0
+        if "dry_runs_gap_to_cpsat" in frame.columns:
+            frame.loc["cpsat", "dry_runs_gap_to_cpsat"] = 0.0
+        if "average_stock_levels_percent_gap_to_cpsat" in frame.columns:
+            frame.loc["cpsat", "average_stock_levels_percent_gap_to_cpsat"] = 0.0
+        if "average_vehicle_utilization_gap_to_cpsat" in frame.columns:
+            frame.loc["cpsat", "average_vehicle_utilization_gap_to_cpsat"] = 0.0
+        if "average_stops_per_trip_gap_to_cpsat" in frame.columns:
+            frame.loc["cpsat", "average_stops_per_trip_gap_to_cpsat"] = 0.0
 
     return frame
 
@@ -787,40 +818,82 @@ def plot_route_map(
     return ax
 
 
-def episode_kpis(env: MPPSRPEnv, episode: dict[str, Any]) -> dict[str, float]:
+def episode_kpis(env: MPPSRPEnv, episode: dict[str, Any]) -> dict[str, Any]:
     steps = episode.get("steps", [])
-    delivered = episode.get("delivered_per_station_day")
-    total_delivered = float(delivered.sum()) if delivered is not None else 0.0
+    daily_inv = np.asarray(episode.get("daily_inventory"))
+    horizon_days = int(env.instance.horizon_days)
 
-    visited_stations = {
-        step["to_node"]
-        for step in steps
-        if step["to_node"] > 0
+    total_travel_time = 0.0
+    total_delivered_amount = 0.0
+    total_trip_capacity = 0.0
+    total_trips = 0.0
+    total_stops = 0.0
+    vehicle_trip_state = {
+        vehicle_idx: {"active": False, "delivered": 0.0, "stops": 0}
+        for vehicle_idx in range(env.instance.n_vehicles)
     }
-    depot_returns = sum(1 for step in steps if step["to_node"] == 0)
-    n_serving_steps = sum(1 for step in steps if step["to_node"] > 0)
 
-    daily_inv = episode.get("daily_inventory")
-    if daily_inv is not None and len(daily_inv) > 1:
-        capacity_total = float(env.instance.station_capacity.sum())
-        avg_fill_per_day = daily_inv.sum(axis=(1, 2)) / max(capacity_total, 1e-6)
-        mean_fill_ratio = float(avg_fill_per_day.mean())
-        final_fill_ratio = float(avg_fill_per_day[-1])
+    for step in steps:
+        vehicle_idx = int(step["vehicle"])
+        from_node = int(step["from_node"])
+        to_node = int(step["to_node"])
+        total_travel_time += float(env.instance.travel_time_matrix[from_node, to_node])
+
+        if to_node > 0:
+            vehicle_trip_state[vehicle_idx]["active"] = True
+            vehicle_trip_state[vehicle_idx]["stops"] += 1
+            delivered = float(step.get("delivered_volume", 0.0))
+            total_delivered_amount += delivered
+            vehicle_trip_state[vehicle_idx]["delivered"] += delivered
+
+        if to_node == 0 and vehicle_trip_state[vehicle_idx]["active"]:
+            total_trips += 1.0
+            total_stops += float(vehicle_trip_state[vehicle_idx]["stops"])
+            total_trip_capacity += float(env.instance.vehicle_total_capacity[vehicle_idx])
+            vehicle_trip_state[vehicle_idx] = {"active": False, "delivered": 0.0, "stops": 0}
+
+    if daily_inv.ndim == 3 and daily_inv.shape[0] > 1:
+        day_end_inventory = [np.asarray(daily_inv[idx], dtype=np.float64) for idx in range(1, daily_inv.shape[0])]
     else:
-        mean_fill_ratio = 0.0
-        final_fill_ratio = 0.0
+        final_inventory = np.asarray(env.state.station_inventory, dtype=np.float64)
+        day_end_inventory = [final_inventory.copy() for _ in range(horizon_days)]
 
+    while len(day_end_inventory) < horizon_days:
+        day_end_inventory.append(day_end_inventory[-1].copy())
+
+    average_stock_levels = _average_stock_levels_like_episode(
+        day_end_inventory=day_end_inventory,
+        n_days=horizon_days,
+    )
+    fill_ratios = [
+        (
+            inventory / np.maximum(env.instance.station_capacity, 1e-6)
+        ).reshape(-1)
+        for inventory in day_end_inventory[:horizon_days]
+    ]
+    fill_ratio_values = np.concatenate(fill_ratios, axis=0) if fill_ratios else np.zeros((0,), dtype=np.float64)
+    dry_runs = sum(
+        float(np.sum(inventory <= env.instance.safety_stock))
+        for inventory in day_end_inventory[:horizon_days]
+    )
+    utilization = (
+        round(100.0 * (total_delivered_amount / total_trip_capacity), 1)
+        if total_trip_capacity > 0
+        else 0.0
+    )
+    avg_stops_per_trip = float(total_stops / total_trips) if total_trips > 0 else 0.0
     terminal = episode.get("terminal_info", {}) or {}
+
     return {
-        "total_distance": float(terminal.get("cumulative_distance", 0.0)),
-        "total_stockout": float(terminal.get("cumulative_stockout", 0.0)),
-        "total_delivered": total_delivered,
-        "unique_stations_visited": float(len(visited_stations)),
-        "depot_returns": float(depot_returns),
-        "service_steps": float(n_serving_steps),
-        "mean_fill_ratio": mean_fill_ratio,
-        "final_fill_ratio": final_fill_ratio,
-        "n_steps": float(len(steps)),
+        "total_travel_distance": float(terminal.get("cumulative_distance", 0.0)),
+        "total_travel_time": float(total_travel_time),
+        "average_stock_levels": np.rint(average_stock_levels).astype(np.int64).tolist(),
+        "average_stock_levels_percent": (
+            100.0 * float(fill_ratio_values.mean()) if fill_ratio_values.size > 0 else 0.0
+        ),
+        "dry_runs": float(dry_runs),
+        "average_vehicle_utilization": float(utilization),
+        "average_stops_per_trip": float(avg_stops_per_trip),
     }
 
 
@@ -846,27 +919,52 @@ def daily_route_frame(episode: dict[str, Any]) -> Any:
 def plot_training_history(history: list[dict[str, float]], *, figsize: tuple[int, int] = (12, 8)) -> Any:
     plt = _require_matplotlib()
     frame = history_to_frame(history)
-    fig, axes = plt.subplots(2, 2, figsize=figsize, constrained_layout=True)
+    fig, axes = plt.subplots(3, 2, figsize=figsize, constrained_layout=True)
 
     if not frame.empty:
-        frame.plot(x="iteration", y=["policy_loss", "value_loss"], ax=axes[0, 0], title="Losses")
-        frame.plot(x="iteration", y=["entropy"], ax=axes[0, 1], title="Entropy")
-
-        eval_cols = [col for col in ("eval_distance", "eval_stockout") if col in frame.columns]
-        if eval_cols:
-            frame.plot(x="iteration", y=eval_cols, ax=axes[1, 0], title="Eval Metrics")
-        reward_cols = [
+        actor_cols = [
             col
             for col in (
-                "eval_reward_distance",
-                "eval_reward_holding",
-                "eval_reward_safety",
-                "eval_reward_time_window",
+                "policy_loss",
+                "policy_surrogate_abs",
             )
             if col in frame.columns
         ]
+        if actor_cols:
+            frame.plot(x="iteration", y=actor_cols, ax=axes[0, 0], title="Actor Surrogate")
+        value_cols = [col for col in ("value_loss", "diversity_loss") if col in frame.columns]
+        if value_cols:
+            frame.plot(x="iteration", y=value_cols, ax=axes[0, 1], title="Critic / Diversity")
+        entropy_cols = [col for col in ("entropy",) if col in frame.columns]
+        if entropy_cols:
+            frame.plot(x="iteration", y=entropy_cols, ax=axes[1, 0], title="Entropy")
+        update_diag_cols = [
+            col
+            for col in (
+                "approx_kl",
+                "clip_fraction",
+            )
+            if col in frame.columns
+        ]
+        if update_diag_cols:
+            frame.plot(x="iteration", y=update_diag_cols, ax=axes[1, 1], title="Update Diagnostics")
+
+        eval_cols = [
+            col
+            for col in (
+                "eval_total_travel_distance",
+                "eval_dry_runs",
+                "eval_average_stock_levels_percent",
+            )
+            if col in frame.columns
+        ]
+        if eval_cols:
+            frame.plot(x="iteration", y=eval_cols, ax=axes[2, 0], title="Eval KPIs")
+        reward_cols = [
+            col for col in frame.columns if col.startswith("eval_reward_")
+        ]
         if reward_cols:
-            frame.plot(x="iteration", y=reward_cols, ax=axes[1, 1], title="Eval Reward Components")
+            frame.plot(x="iteration", y=reward_cols, ax=axes[2, 1], title="Eval Reward Components")
 
     for ax in axes.flat:
         ax.grid(alpha=0.2)
@@ -877,12 +975,15 @@ def plot_algorithm_comparison(
     results: dict[str, dict[str, Any]],
     *,
     metrics: tuple[str, ...] = (
-        "eval_distance",
-        "eval_stockout",
-        "policy_loss",
+        "eval_total_travel_distance",
+        "eval_dry_runs",
+        "eval_average_stock_levels_percent",
+        "eval_average_vehicle_utilization",
+        "policy_surrogate_abs",
+        "approx_kl",
+        "clip_fraction",
         "value_loss",
         "entropy",
-        "eval_reward_safety",
     ),
     figsize: tuple[int, int] = (15, 11),
 ) -> Any:
@@ -958,10 +1059,10 @@ def plot_algorithm_summary_dashboard(
     axes[0, 0].legend()
     axes[0, 0].grid(alpha=0.25, axis="y")
 
-    axes[0, 1].bar(x - width / 2.0, summary["before_stockout"], width=width, color="#d9d9d9", label="untrained policy")
-    axes[0, 1].bar(x + width / 2.0, summary["after_stockout"], width=width, color="#e76f51", label="trained policy")
-    axes[0, 1].set_title("Stockout: Untrained vs Trained Policy")
-    axes[0, 1].set_ylabel("total stockout per episode")
+    axes[0, 1].bar(x - width / 2.0, summary["before_dry_runs"], width=width, color="#d9d9d9", label="untrained policy")
+    axes[0, 1].bar(x + width / 2.0, summary["after_dry_runs"], width=width, color="#e76f51", label="trained policy")
+    axes[0, 1].set_title("Dry Runs: Untrained vs Trained Policy")
+    axes[0, 1].set_ylabel("count")
     axes[0, 1].set_xticks(x, labels)
     axes[0, 1].legend()
     axes[0, 1].grid(alpha=0.25, axis="y")
@@ -974,17 +1075,26 @@ def plot_algorithm_summary_dashboard(
     axes[1, 0].grid(alpha=0.25, axis="y")
     axes[1, 0].bar_label(distance_bars, fmt="%.1f", padding=3, fontsize=9)
 
-    eval_cols = ["eval_distance", "eval_stockout"]
+    eval_cols = [
+        "eval_total_travel_distance",
+        "eval_dry_runs",
+        "eval_average_stock_levels_percent",
+    ]
     available_eval_cols = [col for col in eval_cols if col in summary.columns]
     if available_eval_cols:
         eval_frame = summary[available_eval_cols].copy()
         renamed = {
-            "eval_distance": "distance",
-            "eval_stockout": "stockout",
+            "eval_total_travel_distance": "total_travel_distance",
+            "eval_dry_runs": "dry_runs",
+            "eval_average_stock_levels_percent": "average_stock_levels_percent",
         }
         eval_frame = eval_frame.rename(columns=renamed)
-        eval_frame.plot(kind="bar", ax=axes[1, 1], color=["#457b9d", "#f4a261"][: len(eval_frame.columns)])
-        axes[1, 1].set_title("Final Evaluation Metrics")
+        eval_frame.plot(
+            kind="bar",
+            ax=axes[1, 1],
+            color=["#457b9d", "#f4a261", "#2a9d8f"][: len(eval_frame.columns)],
+        )
+        axes[1, 1].set_title("Final Evaluation KPIs")
         axes[1, 1].set_ylabel("value")
         axes[1, 1].tick_params(axis="x", rotation=0)
         axes[1, 1].grid(alpha=0.2, axis="y")
@@ -1026,16 +1136,16 @@ def plot_cpsat_comparison(
     else:
         axes[0].set_visible(False)
 
-    if "cumulative_stockout" in plot_frame.columns:
-        metric_frame = plot_frame[["cumulative_stockout"]].dropna()
+    if "dry_runs" in plot_frame.columns:
+        metric_frame = plot_frame[["dry_runs"]].dropna()
         colors = ["#2a9d8f" if idx != "cpsat" else "#264653" for idx in metric_frame.index]
         bars = axes[1].bar(
             np.arange(len(metric_frame)),
-            metric_frame["cumulative_stockout"],
+            metric_frame["dry_runs"],
             color=colors,
         )
-        axes[1].set_title("Cumulative Stockout")
-        axes[1].set_ylabel("stockout")
+        axes[1].set_title("Dry Runs")
+        axes[1].set_ylabel("count")
         axes[1].set_xticks(np.arange(len(metric_frame)), metric_frame.index, rotation=0)
         axes[1].grid(alpha=0.25, axis="y")
         axes[1].bar_label(bars, fmt="%.1f", padding=3, fontsize=9)
@@ -1048,8 +1158,8 @@ def plot_cpsat_comparison(
 def plot_algorithm_tradeoffs(
     results: dict[str, dict[str, Any]],
     *,
-    x_key: str = "after_distance",
-    y_key: str = "distance_improvement_pct",
+    x_key: str = "after_total_travel_distance",
+    y_key: str = "after_average_stock_levels_percent",
     figsize: tuple[int, int] = (8, 6),
 ) -> Any:
     plt = _require_matplotlib()
@@ -1063,7 +1173,7 @@ def plot_algorithm_tradeoffs(
         ax.text(row[x_key], row[y_key], f" {algorithm}", va="center", fontsize=10)
     ax.set_xlabel(x_key.replace("_", " ").title())
     ax.set_ylabel(y_key.replace("_", " ").title())
-    ax.set_title("Trade-Off: Final Distance vs Improvement")
+    ax.set_title("Trade-Off: Distance vs Average Stock Level %")
     ax.grid(alpha=0.2)
     return fig
 
@@ -1081,9 +1191,10 @@ def plot_episode_dashboard(
     _plot_episode_routes(env, episode, ax=axes[0, 0])
 
     if not step_frame.empty:
+        reward_cols = [col for col in step_frame.columns if col.startswith("reward_")]
         step_frame.plot(
             x="step",
-            y=["reward_distance", "reward_holding", "reward_safety", "reward_time_window"],
+            y=reward_cols,
             ax=axes[0, 1],
             title="Reward Components per Step",
         )
@@ -1159,6 +1270,40 @@ def _prepare_preferences(
     return tensor
 
 
+def _rollout_for_display(
+    env: MPPSRPEnv,
+    policy: HierarchicalPolicy,
+    *,
+    deterministic: bool,
+    preferences: torch.Tensor | np.ndarray | None,
+    device: torch.device | str | None,
+) -> dict[str, Any]:
+    was_training = policy.training
+    policy.eval()
+    try:
+        return rollout_episode(
+            env,
+            policy,
+            deterministic=deterministic,
+            preferences=preferences,
+            device=device,
+        )
+    finally:
+        if was_training:
+            policy.train()
+
+
+def _reward_components_to_dict(
+    components: tuple[str, ...] | list[str],
+    reward_vec: np.ndarray | torch.Tensor,
+) -> dict[str, float]:
+    values = np.asarray(reward_vec, dtype=np.float32)
+    return {
+        f"reward_{component}": float(values[idx])
+        for idx, component in enumerate(components)
+    }
+
+
 def _require_matplotlib() -> Any:
     try:
         import matplotlib.pyplot as plt
@@ -1190,3 +1335,25 @@ def _maybe_create_axis(ax: Any | None, plt: Any, *, figsize: tuple[int, int]) ->
         fig, axis = plt.subplots(figsize=figsize, constrained_layout=True)
         return fig, axis
     return ax.figure, ax
+
+
+def _is_missing_scalar(value: Any, pd: Any) -> bool:
+    if isinstance(value, (list, tuple, np.ndarray, dict)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except TypeError:
+        return False
+
+
+def _average_stock_levels_like_episode(
+    *,
+    day_end_inventory: list[np.ndarray],
+    n_days: int,
+) -> np.ndarray:
+    average_stock_levels = np.zeros((n_days,), dtype=np.float64)
+    for day_idx in range(n_days):
+        current_inventory = np.asarray(day_end_inventory[day_idx], dtype=np.float64)
+        current_levels = current_inventory[:, -1]
+        average_stock_levels[day_idx] = float(current_levels[current_levels != 0].sum())
+    return average_stock_levels
