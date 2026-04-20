@@ -1,9 +1,0 @@
-defaults:
-  - env: small
-  - algo: ppo
-  - policy: default
-  - experiment: default
-  - _self_
-
-project_name: mp_psrp_rl
-seed: 7
