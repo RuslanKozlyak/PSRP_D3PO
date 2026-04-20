@@ -17,6 +17,7 @@ ENV/
 
 # Jupyter
 .ipynb_checkpoints/
+.jupyter_runtime/
 
 # Local experiment artifacts
 .tmp/
