@@ -40,7 +40,9 @@ class PPOLagrangian(BaseAlgorithm):
             ki=float(pid_cfg.get("ki", 0.01)),
             kd=float(pid_cfg.get("kd", 0.01)),
         )
-        self.lambdas = torch.zeros(len(self.cost_indices), dtype=torch.float32)
+        self.lambda_max = float(self.config.get("lambda_max", 10.0))
+        lambda_init = float(self.config.get("lambda_init", 0.0))
+        self.lambdas = torch.full((len(self.cost_indices),), lambda_init, dtype=torch.float32)
 
     def compute_advantages(self, rollouts: RolloutBatch) -> torch.Tensor:
         reward_weights = self.reward_weights.to(rollouts.rewards_vec.device)
@@ -80,11 +82,14 @@ class PPOLagrangian(BaseAlgorithm):
             cost_advantages.append(cost_adv)
             cost_returns.append(cost_adv + rollouts.values_vec[..., cost_idx])
 
-        advantages = torch.stack([reward_adv, *cost_advantages], dim=-1)
-        reduce_dims = tuple(range(advantages.ndim - 1))
-        adv_mean = advantages.mean(dim=reduce_dims, keepdim=True)
-        adv_std = advantages.std(dim=reduce_dims, keepdim=True).clamp_min(1e-6)
-        advantages = (advantages - adv_mean) / adv_std
+        # Normalize each stream independently: joint normalization squashes the
+        # cost advantages to near-zero when reward variance >> cost variance,
+        # making the Lagrangian term ineffective even at large lambda values.
+        def _norm_stream(x: torch.Tensor) -> torch.Tensor:
+            dims = tuple(range(x.ndim))
+            return (x - x.mean(dim=dims)) / x.std(dim=dims).clamp_min(1e-6)
+
+        advantages = torch.stack([_norm_stream(reward_adv), *[_norm_stream(ca) for ca in cost_advantages]], dim=-1)
         returns = torch.stack([reward_returns, *cost_returns], dim=-1)
         rollouts.advantages = advantages
         rollouts.returns = returns
@@ -195,14 +200,16 @@ class PPOLagrangian(BaseAlgorithm):
     def post_update(self, rollouts: RolloutBatch) -> dict[str, float]:
         if not self.cost_indices:
             return {}
-        costs = rollouts.rewards_vec[..., self.cost_indices].mean(dim=tuple(range(rollouts.rewards_vec.ndim - 1)))
+        # Safety reward is negative (−shortage), so negate to get positive cost signal.
+        # Lagrangian requires cost ≥ 0 and constraint: cost ≤ target.
+        costs = -rollouts.rewards_vec[..., self.cost_indices].mean(dim=tuple(range(rollouts.rewards_vec.ndim - 1)))
         costs = costs.to(self.lambdas.dtype)
         targets = self.cost_targets.to(costs.device)
         updates = []
         for idx in range(len(self.cost_indices)):
             violation = float(costs[idx] - targets[idx])
             delta = self.pid.step(violation) if self.use_pid else self.lambda_lr * violation
-            self.lambdas[idx] = torch.clamp(self.lambdas[idx] + delta, min=0.0)
+            self.lambdas[idx] = torch.clamp(self.lambdas[idx] + delta, min=0.0, max=self.lambda_max)
             updates.append(float(self.lambdas[idx].cpu()))
         return {f"lambda_{idx}": value for idx, value in enumerate(updates)}
 

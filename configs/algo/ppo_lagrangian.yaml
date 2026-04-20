@@ -4,7 +4,7 @@ gamma: 0.99
 gae_lambda: 0.95
 learning_rate: 0.0003
 value_coef: 0.5
-entropy_coef: 0.01
+entropy_coef: 0.05
 max_grad_norm: 0.5
 update_epochs: 4
 minibatch_size: 128
@@ -12,10 +12,15 @@ target_kl: 0.03
 reward_indices: auto
 reward_weights: auto
 cost_indices: auto
-cost_targets: auto
+# Target mean shortage per step (after /demand_scale normalization).
+# ~0.05 means we tolerate 5% of mean daily demand as shortage on average per step.
+# Tune down if the policy is too lax, up if lambda grows too aggressively.
+cost_targets: [0.05]
 lambda_lr: 0.01
+lambda_init: 1.0
+lambda_max: 10.0
 use_pid: true
 pid:
-  kp: 0.1
+  kp: 0.5
   ki: 0.01
-  kd: 0.01
+  kd: 0.005
