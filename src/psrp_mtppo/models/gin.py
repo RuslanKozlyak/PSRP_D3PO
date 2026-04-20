@@ -15,6 +15,13 @@ def make_mlp(input_dim: int, hidden_dims: tuple[int, ...], output_dim: int, drop
 
 
 class GINLayer(nn.Module):
+    """GIN layer, eq. (19) of Lu et al. 2025: ``(1 + eps) h_i + sum_{u in N(i)} h_u``.
+
+    ``adjacency`` is expected to contain the raw (unnormalized) 0/1 connectivity so
+    the matmul realises a true SUM aggregator. If a normalized adjacency is passed,
+    the aggregator degenerates into a mean.
+    """
+
     def __init__(self, input_dim: int, output_dim: int, dropout: float) -> None:
         super().__init__()
         self.eps = nn.Parameter(torch.zeros(1))

@@ -6,17 +6,22 @@ import torch
 from torch import nn
 
 from ..config import EnvironmentConfig, ModelConfig
-from .actors import InventoryActor, RoutingActor
+from .actors import InventoryActor, RoutingActor, RoutingSample
 from .critic import JointCritic
 
 
 @dataclass(slots=True)
 class PolicyOutput:
     replenishment: torch.Tensor
-    route: list[int]
+    inventory_latent: torch.Tensor
+    routing: RoutingSample
     inventory_log_prob: torch.Tensor
     routing_log_prob: torch.Tensor
     value: torch.Tensor
+
+    @property
+    def routes(self) -> list[list[int]]:
+        return self.routing.routes_as_lists()
 
 
 class MTPPOModel(nn.Module):
@@ -32,7 +37,8 @@ class MTPPOModel(nn.Module):
         value = self.critic(obs)
         return PolicyOutput(
             replenishment=inventory_sample.action,
-            route=routing_sample.route,
+            inventory_latent=inventory_sample.latent,
+            routing=routing_sample,
             inventory_log_prob=inventory_sample.log_prob,
             routing_log_prob=routing_sample.log_prob,
             value=value,

@@ -53,8 +53,19 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     training_iterations: int = 12
     evaluation_episodes: int = 4
-    device: str = "cpu"
+    num_envs: int = 8
+    device: str = "auto"
     seed: int = 7
+
+    def resolved_device(self) -> str:
+        if self.device != "auto":
+            return self.device
+        try:
+            import torch  # local import to avoid hard dependency at dataclass creation
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
 
 
 @dataclass(slots=True)

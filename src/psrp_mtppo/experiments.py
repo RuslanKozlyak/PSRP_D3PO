@@ -7,8 +7,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm.auto import tqdm
 
-from .baselines import evaluate_heuristic_baseline
+from .baselines import evaluate_baseline
 from .config import EnvironmentConfig, ModelConfig, TrainingConfig
+from .ga import GAConfig
 from .rl.trainer import MTPPOTrainer
 
 
@@ -30,7 +31,8 @@ def run_scale_sweep(
     base_env_config: EnvironmentConfig | None = None,
     model_config: ModelConfig | None = None,
     training_config: TrainingConfig | None = None,
-    baseline_solver: str = "ortools",
+    baselines: Iterable[str] = ("ga_irp",),
+    ga_config: GAConfig | None = None,
     show_progress: bool = False,
 ) -> pd.DataFrame:
     base_env_config = base_env_config or EnvironmentConfig()
@@ -54,11 +56,6 @@ def run_scale_sweep(
             show_progress=show_progress,
         )
         joint_metrics = trainer.evaluate(training_config.evaluation_episodes)
-        baseline_metrics = evaluate_heuristic_baseline(
-            env_config,
-            episodes=training_config.evaluation_episodes,
-            route_solver=baseline_solver,
-        ).mean(numeric_only=True)
         rows.append(
             {
                 "algorithm": "MTPPO",
@@ -71,22 +68,28 @@ def run_scale_sweep(
                 "last_mean_return": float(history["mean_return"].iloc[-1]),
             }
         )
-        rows.append(
-            {
-                "algorithm": f"Heuristic-{baseline_solver}",
-                "retailers": scale,
-                "inventory_cost": float(baseline_metrics["inventory_cost"]),
-                "route_distance": float(baseline_metrics["route_distance"]),
-                "route_cost": float(baseline_metrics["route_cost"]),
-                "fill_rate": float(baseline_metrics["fill_rate"]),
-                "sum_cost": float(baseline_metrics["sum_cost"]),
-                "last_mean_return": float("nan"),
-            }
-        )
+        for baseline in baselines:
+            baseline_metrics = evaluate_baseline(
+                env_config,
+                baseline=baseline,
+                episodes=training_config.evaluation_episodes,
+                ga_config=ga_config,
+            ).mean(numeric_only=True)
+            rows.append(
+                {
+                    "algorithm": baseline.upper(),
+                    "retailers": scale,
+                    "inventory_cost": float(baseline_metrics["inventory_cost"]),
+                    "route_distance": float(baseline_metrics["route_distance"]),
+                    "route_cost": float(baseline_metrics["route_cost"]),
+                    "fill_rate": float(baseline_metrics["fill_rate"]),
+                    "sum_cost": float(baseline_metrics["sum_cost"]),
+                    "last_mean_return": float("nan"),
+                }
+            )
         scale_iterator.set_postfix(
             retailers=scale,
             mtppo_sum_cost=f"{joint_metrics['eval_sum_cost']:.2f}",
-            baseline_sum_cost=f"{float(baseline_metrics['sum_cost']):.2f}",
         )
 
     return pd.DataFrame(rows)

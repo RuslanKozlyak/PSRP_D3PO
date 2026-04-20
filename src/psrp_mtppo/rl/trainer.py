@@ -20,6 +20,7 @@ from ..utils import set_seed, stack_observations
 class RolloutBatch:
     observations: list[dict[str, np.ndarray]] = field(default_factory=list)
     inventory_actions: list[np.ndarray] = field(default_factory=list)
+    inventory_latents: list[np.ndarray] = field(default_factory=list)
     routes: list[list[int]] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
     inventory_log_probs: list[float] = field(default_factory=list)
@@ -28,6 +29,64 @@ class RolloutBatch:
     returns: list[float] = field(default_factory=list)
     advantages: list[float] = field(default_factory=list)
     infos: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _stack_obs_dict(observations: list[dict[str, np.ndarray]], device: torch.device) -> dict[str, torch.Tensor]:
+    keys = observations[0].keys()
+    out: dict[str, torch.Tensor] = {}
+    for key in keys:
+        arr = np.stack([np.asarray(obs[key]) for obs in observations])
+        out[key] = torch.as_tensor(arr, dtype=torch.float32, device=device)
+    return out
+
+
+class ParallelEnvRunner:
+    """Synchronous vector env wrapper that keeps the policy forward batched."""
+
+    def __init__(self, env_config: EnvironmentConfig, num_envs: int, seed_offset: int = 0) -> None:
+        self.env_config = env_config
+        self.envs = [IRPVMIEnv(env_config) for _ in range(num_envs)]
+        self.seed_offset = seed_offset
+        self.active = [True] * num_envs
+        self._observations: list[dict[str, np.ndarray]] = [None] * num_envs  # type: ignore[list-item]
+
+    def reset(self, base_seed: int) -> list[dict[str, np.ndarray]]:
+        self.active = [True] * len(self.envs)
+        for idx, env in enumerate(self.envs):
+            obs, _info = env.reset(seed=base_seed + idx + self.seed_offset)
+            self._observations[idx] = obs
+        return list(self._observations)
+
+    def step(
+        self,
+        replenishments: np.ndarray,
+        routes: list[list[int]],
+    ) -> tuple[list[dict[str, np.ndarray]], list[float], list[bool], list[dict[str, Any]]]:
+        new_obs: list[dict[str, np.ndarray]] = []
+        rewards: list[float] = []
+        dones: list[bool] = []
+        infos: list[dict[str, Any]] = []
+        for idx, env in enumerate(self.envs):
+            if not self.active[idx]:
+                new_obs.append(self._observations[idx])
+                rewards.append(0.0)
+                dones.append(True)
+                infos.append({})
+                continue
+            obs, reward, terminated, _truncated, info = env.step(
+                JointAction(replenishment=replenishments[idx].astype(np.float32), route=routes[idx])
+            )
+            new_obs.append(obs)
+            rewards.append(float(reward))
+            dones.append(bool(terminated))
+            infos.append(info)
+            self._observations[idx] = obs
+            if terminated:
+                self.active[idx] = False
+        return new_obs, rewards, dones, infos
+
+    def any_active(self) -> bool:
+        return any(self.active)
 
 
 class MTPPOTrainer:
@@ -40,8 +99,8 @@ class MTPPOTrainer:
         self.env_config = env_config
         self.model_config = model_config
         self.training_config = training_config
-        device_name = training_config.device
-        if device_name == "cuda" and not torch.cuda.is_available():
+        device_name = training_config.resolved_device()
+        if device_name.startswith("cuda") and not torch.cuda.is_available():
             device_name = "cpu"
         self.device = torch.device(device_name)
         set_seed(training_config.seed)
@@ -60,6 +119,10 @@ class MTPPOTrainer:
             lr=training_config.learning_rate,
         )
         self.history: list[dict[str, float]] = []
+
+    # ------------------------------------------------------------------
+    # Trace helpers
+    # ------------------------------------------------------------------
 
     def _build_trace_artifacts(
         self,
@@ -113,17 +176,16 @@ class MTPPOTrainer:
             disable=not show_progress,
         )
 
+        self.model.eval()
         try:
             while not terminated:
-                tensor_obs = {
-                    key: torch.as_tensor(value, dtype=torch.float32, device=self.device).unsqueeze(0)
-                    for key, value in obs.items()
-                }
+                tensor_obs = _stack_obs_dict([obs], self.device)
                 with torch.no_grad():
                     policy_output = self.model.act(tensor_obs, greedy=greedy)
-                replenishment = policy_output.replenishment.squeeze(0).cpu().numpy().astype(np.float32)
+                replenishment = policy_output.replenishment[0].cpu().numpy().astype(np.float32)
+                route = policy_output.routes[0]
                 next_obs, reward, terminated, _truncated, info = env.step(
-                    JointAction(replenishment=replenishment, route=policy_output.route)
+                    JointAction(replenishment=replenishment, route=route)
                 )
 
                 inventory_before_rows.append(np.asarray(info["inventory_before_replenishment"], dtype=np.float32))
@@ -170,6 +232,7 @@ class MTPPOTrainer:
                 )
         finally:
             iterator.close()
+        self.model.train()
 
         trace_tables = self._build_trace_artifacts(
             daily_rows=daily_rows,
@@ -190,9 +253,29 @@ class MTPPOTrainer:
         }
         return episode_summary, trace_tables
 
+    # ------------------------------------------------------------------
+    # Rollout collection
+    # ------------------------------------------------------------------
+
+    def _num_parallel_envs(self) -> int:
+        return max(1, int(getattr(self.training_config, "num_envs", 1) or 1))
+
     def collect_batch(self, batch_size: int | None = None, show_progress: bool = False) -> RolloutBatch:
         target_steps = batch_size or self.training_config.train_batch_size
         batch = RolloutBatch()
+        num_envs = self._num_parallel_envs()
+        runner = ParallelEnvRunner(self.env_config, num_envs=num_envs)
+
+        episode_rewards: list[list[float]] = [[] for _ in range(num_envs)]
+        episode_values: list[list[float]] = [[] for _ in range(num_envs)]
+        episode_obs: list[list[dict[str, np.ndarray]]] = [[] for _ in range(num_envs)]
+        episode_inventory: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
+        episode_inventory_latents: list[list[np.ndarray]] = [[] for _ in range(num_envs)]
+        episode_routes: list[list[list[int]]] = [[] for _ in range(num_envs)]
+        episode_inventory_lp: list[list[float]] = [[] for _ in range(num_envs)]
+        episode_routing_lp: list[list[float]] = [[] for _ in range(num_envs)]
+        episode_infos: list[list[dict[str, Any]]] = [[] for _ in range(num_envs)]
+
         progress = tqdm(
             total=target_steps,
             desc="Collect rollout",
@@ -200,65 +283,105 @@ class MTPPOTrainer:
             dynamic_ncols=True,
             disable=not show_progress,
         )
+
+        rng = np.random.default_rng(int(np.random.randint(0, 10_000)))
         episodes_collected = 0
 
         try:
             while len(batch.rewards) < target_steps:
-                env = IRPVMIEnv(self.env_config)
-                obs, _info = env.reset(seed=int(np.random.randint(0, 10_000)))
-                episode_rewards: list[float] = []
-                episode_values: list[float] = []
-                episode_start = len(batch.rewards)
+                base_seed = int(rng.integers(0, 10_000_000))
+                observations = runner.reset(base_seed)
+                active_mask = [True] * num_envs
 
-                terminated = False
-                while not terminated:
-                    tensor_obs = {
-                        key: torch.as_tensor(value, dtype=torch.float32, device=self.device).unsqueeze(0)
-                        for key, value in obs.items()
-                    }
+                while any(active_mask):
+                    active_indices = [idx for idx, flag in enumerate(active_mask) if flag]
+                    active_obs = [observations[idx] for idx in active_indices]
+                    tensor_obs = _stack_obs_dict(active_obs, self.device)
                     with torch.no_grad():
                         policy_output = self.model.act(tensor_obs, greedy=False)
+                    replenishments_np = policy_output.replenishment.cpu().numpy().astype(np.float32)
+                    latents_np = policy_output.inventory_latent.cpu().numpy().astype(np.float32)
+                    routes = policy_output.routes
+                    inv_logp = policy_output.inventory_log_prob.detach().cpu().numpy()
+                    route_logp = policy_output.routing_log_prob.detach().cpu().numpy()
+                    values = policy_output.value.detach().cpu().numpy()
 
-                    replenishment = policy_output.replenishment.squeeze(0).cpu().numpy().astype(np.float32)
-                    joint_action = JointAction(replenishment=replenishment, route=policy_output.route)
-                    next_obs, reward, terminated, _truncated, info = env.step(joint_action)
+                    all_repl = np.zeros((num_envs, self.env_config.num_retailers), dtype=np.float32)
+                    all_latents = np.zeros((num_envs, self.env_config.num_retailers), dtype=np.float32)
+                    all_routes: list[list[int]] = [[0, 0] for _ in range(num_envs)]
+                    for local_idx, env_idx in enumerate(active_indices):
+                        all_repl[env_idx] = replenishments_np[local_idx]
+                        all_latents[env_idx] = latents_np[local_idx]
+                        all_routes[env_idx] = routes[local_idx]
 
-                    batch.observations.append(obs)
-                    batch.inventory_actions.append(replenishment)
-                    batch.routes.append(policy_output.route)
-                    batch.rewards.append(float(reward))
-                    batch.inventory_log_probs.append(float(policy_output.inventory_log_prob.item()))
-                    batch.routing_log_probs.append(float(policy_output.routing_log_prob.item()))
-                    batch.values.append(float(policy_output.value.item()))
-                    batch.infos.append(info)
-                    episode_rewards.append(float(reward))
-                    episode_values.append(float(policy_output.value.item()))
-                    obs = next_obs
+                    for local_idx, env_idx in enumerate(active_indices):
+                        episode_obs[env_idx].append(observations[env_idx])
+                        episode_inventory[env_idx].append(all_repl[env_idx].copy())
+                        episode_inventory_latents[env_idx].append(all_latents[env_idx].copy())
+                        episode_routes[env_idx].append(all_routes[env_idx])
+                        episode_inventory_lp[env_idx].append(float(inv_logp[local_idx]))
+                        episode_routing_lp[env_idx].append(float(route_logp[local_idx]))
+                        episode_values[env_idx].append(float(values[local_idx]))
 
-                returns = []
-                running_return = 0.0
-                for reward in reversed(episode_rewards):
-                    running_return = reward + self.training_config.gamma * running_return
-                    returns.append(running_return)
-                returns.reverse()
-                advantages = [ret - val for ret, val in zip(returns, episode_values)]
+                    new_observations, rewards, dones, infos = runner.step(all_repl, all_routes)
+                    for local_idx, env_idx in enumerate(active_indices):
+                        episode_rewards[env_idx].append(rewards[env_idx])
+                        episode_infos[env_idx].append(infos[env_idx])
+                        observations[env_idx] = new_observations[env_idx]
+                        if dones[env_idx]:
+                            active_mask[env_idx] = False
 
-                batch.returns.extend(returns)
-                batch.advantages.extend(advantages)
+                for env_idx in range(num_envs):
+                    if not episode_rewards[env_idx]:
+                        continue
+                    rewards_arr = episode_rewards[env_idx]
+                    values_arr = episode_values[env_idx]
+                    returns: list[float] = []
+                    running = 0.0
+                    for reward in reversed(rewards_arr):
+                        running = reward + self.training_config.gamma * running
+                        returns.append(running)
+                    returns.reverse()
+                    advantages = [ret - val for ret, val in zip(returns, values_arr)]
 
-                episode_end = len(batch.rewards)
-                assert episode_end - episode_start == len(returns)
-                progress.update(episode_end - episode_start)
-                episodes_collected += 1
-                progress.set_postfix(
-                    steps=len(batch.rewards),
-                    episodes=episodes_collected,
-                    last_episode_return=round(sum(episode_rewards), 2),
-                )
+                    batch.observations.extend(episode_obs[env_idx])
+                    batch.inventory_actions.extend(episode_inventory[env_idx])
+                    batch.inventory_latents.extend(episode_inventory_latents[env_idx])
+                    batch.routes.extend(episode_routes[env_idx])
+                    batch.rewards.extend(rewards_arr)
+                    batch.inventory_log_probs.extend(episode_inventory_lp[env_idx])
+                    batch.routing_log_probs.extend(episode_routing_lp[env_idx])
+                    batch.values.extend(values_arr)
+                    batch.returns.extend(returns)
+                    batch.advantages.extend(advantages)
+                    batch.infos.extend(episode_infos[env_idx])
+
+                    progress.update(len(rewards_arr))
+                    episodes_collected += 1
+                    progress.set_postfix(
+                        steps=len(batch.rewards),
+                        episodes=episodes_collected,
+                        last_episode_return=round(float(sum(rewards_arr)), 2),
+                    )
+
+                for env_idx in range(num_envs):
+                    episode_rewards[env_idx] = []
+                    episode_values[env_idx] = []
+                    episode_obs[env_idx] = []
+                    episode_inventory[env_idx] = []
+                    episode_inventory_latents[env_idx] = []
+                    episode_routes[env_idx] = []
+                    episode_inventory_lp[env_idx] = []
+                    episode_routing_lp[env_idx] = []
+                    episode_infos[env_idx] = []
         finally:
             progress.close()
 
         return batch
+
+    # ------------------------------------------------------------------
+    # PPO update
+    # ------------------------------------------------------------------
 
     def _critic_loss(
         self,
@@ -276,6 +399,11 @@ class MTPPOTrainer:
 
     def update(self, batch: RolloutBatch, show_progress: bool = False) -> dict[str, float]:
         observations = stack_observations(batch.observations, self.device)
+        inventory_latents = torch.as_tensor(
+            np.stack(batch.inventory_latents),
+            dtype=torch.float32,
+            device=self.device,
+        )
         inventory_actions = torch.as_tensor(
             np.stack(batch.inventory_actions),
             dtype=torch.float32,
@@ -323,6 +451,7 @@ class MTPPOTrainer:
 
                     mini_obs = {key: value[batch_indices] for key, value in observations.items()}
                     mini_inventory_actions = inventory_actions[batch_indices]
+                    mini_inventory_latents = inventory_latents[batch_indices]
                     mini_advantages = advantages[batch_indices]
                     mini_returns = returns[batch_indices]
                     mini_old_inventory_log_probs = old_inventory_log_probs[batch_indices]
@@ -332,7 +461,7 @@ class MTPPOTrainer:
 
                     current_inventory_log_prob, inventory_entropy = self.model.inventory_actor.evaluate_actions(
                         mini_obs,
-                        mini_inventory_actions,
+                        mini_inventory_latents,
                     )
                     inventory_ratio = torch.exp(current_inventory_log_prob - mini_old_inventory_log_probs)
                     inventory_loss = -torch.min(
@@ -347,19 +476,11 @@ class MTPPOTrainer:
                     inventory_loss = inventory_loss + self.training_config.kl_coefficient * inventory_kl
                     inventory_loss = inventory_loss - self.training_config.entropy_coefficient * inventory_entropy.mean()
 
-                    routing_log_probs = []
-                    routing_entropies = []
-                    for obs_index, route in enumerate(mini_routes):
-                        single_obs = {key: value[obs_index : obs_index + 1] for key, value in mini_obs.items()}
-                        log_prob, entropy = self.model.routing_actor.evaluate_sequence(
-                            single_obs,
-                            mini_inventory_actions[obs_index : obs_index + 1],
-                            route,
-                        )
-                        routing_log_probs.append(log_prob)
-                        routing_entropies.append(entropy)
-                    current_routing_log_prob = torch.cat(routing_log_probs, dim=0)
-                    routing_entropy = torch.cat(routing_entropies, dim=0)
+                    current_routing_log_prob, routing_entropy = self.model.routing_actor.evaluate_routes(
+                        mini_obs,
+                        mini_inventory_actions,
+                        mini_routes,
+                    )
                     routing_ratio = torch.exp(current_routing_log_prob - mini_old_routing_log_probs)
                     routing_loss = -torch.min(
                         routing_ratio * mini_advantages,
@@ -444,6 +565,7 @@ class MTPPOTrainer:
             dynamic_ncols=True,
             disable=not show_progress,
         )
+        self.model.eval()
         for episode_idx in iterator:
             env = IRPVMIEnv(self.env_config)
             obs, _ = env.reset(seed=episode_idx + 123)
@@ -457,17 +579,13 @@ class MTPPOTrainer:
                 "days": 0.0,
             }
             while not terminated:
-                tensor_obs = {
-                    key: torch.as_tensor(value, dtype=torch.float32, device=self.device).unsqueeze(0)
-                    for key, value in obs.items()
-                }
+                tensor_obs = _stack_obs_dict([obs], self.device)
                 with torch.no_grad():
                     policy_output = self.model.act(tensor_obs, greedy=True)
+                replenishment = policy_output.replenishment[0].cpu().numpy().astype(np.float32)
+                route = policy_output.routes[0]
                 next_obs, reward, terminated, _truncated, info = env.step(
-                    JointAction(
-                        replenishment=policy_output.replenishment.squeeze(0).cpu().numpy(),
-                        route=policy_output.route,
-                    )
+                    JointAction(replenishment=replenishment, route=route)
                 )
                 episode_metrics["reward"] += reward
                 episode_metrics["inventory_cost"] += float(info["inventory_cost"])
@@ -486,5 +604,6 @@ class MTPPOTrainer:
                 fill_rate=f"{episode_metrics['fill_rate']:.3f}",
             )
 
+        self.model.train()
         summary = pd.DataFrame(metrics).mean(numeric_only=True).to_dict()
         return {f"eval_{key}": float(value) for key, value in summary.items()}

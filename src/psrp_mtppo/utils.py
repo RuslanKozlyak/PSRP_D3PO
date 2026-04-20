@@ -15,10 +15,17 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def complete_adjacency(num_nodes: int) -> torch.Tensor:
+def complete_adjacency(num_nodes: int, normalize: bool = False) -> torch.Tensor:
+    """Adjacency of the complete graph on ``num_nodes`` nodes (no self-loops).
+
+    GIN in the paper (eq. 19) uses *sum* aggregation over neighbours, so by
+    default we return the raw 0/1 adjacency. ``normalize=True`` divides by the
+    neighbour count for a mean aggregator (kept for experimentation).
+    """
     adjacency = torch.ones(num_nodes, num_nodes, dtype=torch.float32)
     adjacency.fill_diagonal_(0.0)
-    adjacency /= max(num_nodes - 1, 1)
+    if normalize:
+        adjacency /= max(num_nodes - 1, 1)
     return adjacency
 
 

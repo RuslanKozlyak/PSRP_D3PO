@@ -32,12 +32,17 @@ class JointCritic(nn.Module):
             1,
             model_config.dropout,
         )
+        self.register_buffer(
+            "_adjacency",
+            complete_adjacency(env_config.num_retailers),
+            persistent=False,
+        )
 
     def forward(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
         features = obs["inventory_node_features"]
         state = obs["inventory_state"]
-        batch_size, num_retailers = features.shape[:2]
-        adjacency = complete_adjacency(num_retailers).to(features.device).expand(batch_size, -1, -1)
+        batch_size = features.shape[0]
+        adjacency = self._adjacency.expand(batch_size, -1, -1)
         graph_hidden = self.node_encoder(features, adjacency)
         state_hidden = self.state_encoder(state)
         hidden = self.project(torch.cat([graph_hidden, state_hidden], dim=-1))

@@ -238,8 +238,7 @@ class IRPVMIEnv(gym.Env[dict[str, np.ndarray], dict[str, Any]]):
             lost_sales.sum() * self.config.product_price * self.config.sales_loss_penalty
         )
         route_cost = float(route_execution.distance * self.config.transport_cost_per_distance)
-        invalid_penalty = float(route_execution.invalid_moves * self.config.transport_cost_per_distance * 0.05)
-        total_reward = -(holding_cost + sales_loss_cost + route_cost + invalid_penalty)
+        total_reward = -(holding_cost + sales_loss_cost + route_cost)
 
         self.inventory = ending_inventory.astype(np.float32)
         self.supplier_inventory -= float(replenishment.sum())

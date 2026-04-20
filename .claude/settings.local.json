@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json; nb=json.load\\(open\\(r'D:\\\\PythonProjects\\\\PSRP_D3PO\\\\notebooks\\\\01_mtppo_irp_vmi.ipynb','r',encoding='utf-8'\\)\\); print\\('cells:', len\\(nb['cells']\\)\\); print\\('meta keys:', list\\(nb.keys\\(\\)\\)\\); print\\('first cell types:', [c['cell_type'] for c in nb['cells']]\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python _rewrite_nb.py)",
+      "Bash(python -c \"import numpy, torch, pandas, gymnasium, matplotlib, tqdm; print\\('all deps OK'\\)\")",
+      "Bash(where python *)",
+      "Bash(.venv311/Scripts/python.exe -c \"import numpy, torch, pandas, gymnasium; print\\('numpy', numpy.__version__, 'torch', torch.__version__, 'cuda', torch.cuda.is_available\\(\\)\\)\")",
+      "Bash(.venv311/Scripts/python.exe -m pytest tests/ -q)",
+      "Bash(.venv311/Scripts/python.exe -m unittest discover -s tests -v)"
+    ]
+  }
+}

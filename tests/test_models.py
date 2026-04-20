@@ -26,9 +26,10 @@ class ModelTests(unittest.TestCase):
         output = model.act(tensor_obs, greedy=False)
 
         self.assertEqual(tuple(output.replenishment.shape), (1, 5))
-        self.assertGreaterEqual(output.route[0], 0)
-        self.assertEqual(output.route[0], 0)
-        self.assertEqual(output.route[-1], 0)
+        route = output.routes[0]
+        self.assertGreaterEqual(len(route), 2)
+        self.assertEqual(route[0], 0)
+        self.assertEqual(route[-1], 0)
         self.assertTrue(torch.isfinite(output.inventory_log_prob).all())
         self.assertTrue(torch.isfinite(output.routing_log_prob).all())
         self.assertTrue(torch.isfinite(output.value).all())
